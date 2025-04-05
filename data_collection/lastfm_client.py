@@ -2,8 +2,6 @@
 
 import os
 import logging
-import json # <-- Import json
-import requests # <-- Import requests
 import pylast
 from dotenv import load_dotenv
 import time
@@ -16,81 +14,48 @@ load_dotenv()
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
 LASTFM_API_SECRET = os.getenv("LASTFM_API_SECRET")
 LASTFM_USERNAME = os.getenv("LASTFM_USERNAME")
-FASTMCP_SERVER_URL = os.getenv("FASTMCP_SERVER_URL") # <-- Get MCP URL
+# LASTFM_PASSWORD_HASH = os.getenv("LASTFM_PASSWORD_HASH") # Only needed for write access
 
 if not all([LASTFM_API_KEY, LASTFM_API_SECRET, LASTFM_USERNAME]):
     logging.error("Last.fm API credentials not found in environment variables.")
-    raise ValueError("Missing Last.fm API credentials in .env file")
-if not FASTMCP_SERVER_URL:
-    logging.warning("FASTMCP_SERVER_URL not found in .env file. Data will not be sent.")
-
-# --- Function to send data to MCP (can be shared via a util module later) ---
-def send_to_mcp(endpoint: str, data: list, server_url: str = FASTMCP_SERVER_URL):
-    """Sends data payload to the specified MCP endpoint via POST request."""
-    if not server_url:
-        logging.warning(f"MCP Server URL not configured. Cannot send data to {endpoint}.")
-        return False
-    if not data:
-        logging.info(f"No data provided to send to {endpoint}.")
-        return True
-
-    url = f"{server_url.rstrip('/')}/{endpoint.lstrip('/')}"
-    headers = {'Content-Type': 'application/json'}
-    # Add authentication headers here if needed
-
-    try:
-        # Need to ensure datetime objects are handled - Pylast might return them.
-        # The current fetching logic converts timestamp to int/string, which is fine.
-        payload = json.dumps(data)
-        response = requests.post(url, headers=headers, data=payload, timeout=30)
-        response.raise_for_status()
-        logging.info(f"Successfully sent {len(data)} items to MCP endpoint: {endpoint}")
-        return True
-    except requests.exceptions.ConnectionError as e:
-        logging.error(f"MCP Connection Error: Could not connect to {url}. Error: {e}")
-    except requests.exceptions.Timeout:
-        logging.error(f"MCP Request Timeout: Timed out connecting to {url}")
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"MCP HTTP Error: Failed to send data to {url}. Status: {e.response.status_code}, Response: {e.response.text}")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"MCP Request Error: An error occurred sending data to {url}. Error: {e}")
-    except json.JSONDecodeError as e:
-         logging.error(f"JSON Error: Failed to encode data for sending to {url}. Error: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected Error sending data to MCP: {e}")
-
-    return False
-
+    raise ValueError("Missing Last.fm API credentials in .env file (LASTFM_API_KEY, LASTFM_API_SECRET, LASTFM_USERNAME)")
 
 class LastFMClient:
     """
     A client to interact with the Last.fm API using Pylast.
-    Includes functionality to send collected data to a central MCP server.
+    Handles authentication and provides methods to fetch user data.
     """
     def __init__(self, api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET, username=LASTFM_USERNAME):
-        # ... (Initialization logic remains the same) ...
+        """
+        Initializes the Last.fm network client.
+        """
         self.network = None
         self.username = username
         try:
+            # Initialize the network object. Authentication for user-specific read methods
+            # typically only requires the username passed to the method call.
+            # Password hash is usually only needed for write operations or specific auth methods.
             self.network = pylast.LastFMNetwork(api_key=api_key, api_secret=api_secret)
             logging.info("Successfully initialized Last.fm network connection.")
+            # Test connection by getting user object (doesn't require password hash)
             self.get_user() # Check if username is valid
+
         except pylast.WSError as e:
             logging.error(f"Failed to initialize Last.fm network. Error: {e}")
-            print(f"\n>>> Last.fm API Error <<<\nPlease ensure API Key/Secret are correct. Error: {e}")
+            print(f"\n>>> Last.fm API Error <<<\nPlease ensure your API Key/Secret in .env are correct. Error: {e}")
             raise
         except Exception as e:
             logging.error(f"An unexpected error occurred during Last.fm client initialization: {e}")
             raise
 
     def get_user(self):
-        # ... (Remains the same) ...
+        """Gets the Pylast User object for the configured username."""
         if not self.network:
             logging.error("Last.fm network not initialized.")
             return None
         try:
             user = self.network.get_user(self.username)
-            # Don't log success here every time it's called internally
+            logging.info(f"Successfully obtained Last.fm user object for '{self.username}'.")
             return user
         except pylast.WSError as e:
             logging.error(f"Could not get Last.fm user '{self.username}'. Is the username correct? Error: {e}")
@@ -99,13 +64,25 @@ class LastFMClient:
             logging.error(f"Unexpected error getting Last.fm user: {e}")
             return None
 
-    def get_recent_tracks(self, limit=200, max_pages=None, time_from=None, time_to=None, send_data_to_mcp=True): # Added flag
-        """ Fetches recent tracks and optionally sends them to the MCP server page by page. """
+    def get_recent_tracks(self, limit=200, max_pages=None, time_from=None, time_to=None):
+        """
+        Retrieves the recent tracks (scrobbles) for the configured user.
+
+        Args:
+            limit (int): Number of results per page (max 200 for recent tracks).
+            max_pages (int, optional): Maximum number of pages to retrieve. Defaults to None (retrieve all available within time range).
+            time_from (int, optional): Unix timestamp. Only fetch results after this time.
+            time_to (int, optional): Unix timestamp. Only fetch results before this time.
+
+        Returns:
+            list: A list of dictionaries, each representing a scrobbled track
+                  (artist, title, album, timestamp). Returns an empty list on error.
+        """
         user = self.get_user()
         if not user:
             return []
 
-        all_recent_tracks = [] # Collect all tracks locally too
+        recent_tracks = []
         page = 1
         total_fetched = 0
         processed_pages = 0
@@ -116,76 +93,84 @@ class LastFMClient:
             if max_pages is not None and processed_pages >= max_pages:
                 logging.info(f"Reached max_pages limit ({max_pages}). Stopping.")
                 break
-
-            page_tracks = [] # Collect tracks for this page/batch
             try:
+                # Note: Pylast's get_recent_tracks handles pagination internally via the generator
+                # but we might want explicit page control for large histories or rate limits.
+                # The 'limit' here is results *per page*.
+                # Pylast might fetch more than 'limit' if iterating fully? Let's test.
+                # Update: Pylast's get_recent_tracks returns a generator that yields Track objects.
+                # Let's use the lower-level `user.get_recent_tracks` which seems more controllable.
+
                 results = user.get_recent_tracks(
-                    limit=limit,
+                    limit=limit, # This might actually be total limit for the call in some pylast versions? Test needed. Let's assume per page for now.
                     page=page,
                     time_from=time_from,
                     time_to=time_to,
-                    stream=False
+                    stream=False # Get a list for the page, not a generator
                 )
 
                 if not results:
                     logging.info(f"No more tracks found on page {page}.")
                     break
 
+                page_tracks = 0
                 for item in results:
+                    # Sometimes the album might be None or missing info
                     album_name = item.track.get_album().get_title() if item.track.get_album() else None
-                    track_data = {
+
+                    recent_tracks.append({
                         'artist': item.track.artist.name,
                         'title': item.track.title,
                         'album': album_name,
-                        'timestamp_uts': int(item.playback_date.timestamp()),
-                        'datetime_utc': item.playback_date.strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                    all_recent_tracks.append(track_data)
-                    page_tracks.append(track_data) # Add to page batch
+                        'timestamp_uts': int(item.playback_date.timestamp()), # Unix timestamp
+                        'datetime_utc': item.playback_date.strftime('%Y-%m-%d %H:%M:%S') # Human-readable UTC
+                    })
+                    page_tracks += 1
                     total_fetched += 1
 
-                logging.info(f"Fetched {len(page_tracks)} tracks from page {page}. Total fetched so far: {total_fetched}")
-
-                # --- Send this page/batch of tracks to MCP ---
-                if send_data_to_mcp and page_tracks:
-                    send_to_mcp("/submit/lastfm/scrobbles", page_tracks)
-                # ---------------------------------------------
-
+                logging.info(f"Fetched {page_tracks} tracks from page {page}. Total fetched so far: {total_fetched}")
                 processed_pages += 1
 
-                if len(page_tracks) < limit:
+                # Simple check: If we received fewer tracks than the limit, we're likely on the last page
+                if page_tracks < limit:
                      logging.info("Received fewer tracks than limit, assuming end of results.")
                      break
 
                 page += 1
-                time.sleep(0.2) # Basic rate limiting
+                # Optional: Add a small delay to avoid hitting rate limits aggressively
+                time.sleep(0.2)
 
             except pylast.WSError as e:
+                # Handle specific Last.fm errors (e.g., rate limiting)
                 logging.error(f"Last.fm API error on page {page}: {e}")
+                # You might want retry logic here, especially for rate limit errors (code 29)
                 break
             except Exception as e:
                 logging.error(f"Unexpected error fetching recent tracks on page {page}: {e}")
                 break
 
-        logging.info(f"Finished fetching recent tracks. Total retrieved: {len(all_recent_tracks)}")
-        return all_recent_tracks # Return all collected tracks
+        logging.info(f"Finished fetching recent tracks. Total retrieved: {len(recent_tracks)}")
+        return recent_tracks
 
+    # --- Add more methods as needed ---
+    # e.g., get_track_info (tags, listeners), get_user_top_artists/tracks
 
-# --- Example Usage (Updated for MCP) ---
+# --- Example Usage (for testing this script directly) ---
 if __name__ == "__main__":
     logging.info("Running Last.fm Client script directly for testing...")
-    if not FASTMCP_SERVER_URL:
-         print("!!! Warning: FASTMCP_SERVER_URL is not set in .env. Data cannot be sent. Testing fetch only.")
-
     try:
         client = LastFMClient()
 
-        print("\n--- Testing get_recent_tracks (sending to MCP enabled by default) ---")
-        # Fetch only 1 page with up to 10 tracks for testing
-        tracks = client.get_recent_tracks(limit=10, max_pages=1, send_data_to_mcp=True)
+        # Test getting recent tracks (limit to 10 for testing)
+        print("\n--- Testing get_recent_tracks ---")
+        # Fetch only the 10 most recent tracks using the limit parameter directly
+        # Note: Pylast documentation/behavior on limit vs pages can be tricky.
+        # This call might retrieve up to `limit` items total.
+        tracks = client.get_recent_tracks(limit=10, max_pages=1) # Explicitly get only first page up to 10 items
 
         if tracks:
-            print(f"Retrieved {len(tracks)} recent tracks locally (check logs for MCP send status).")
+            print(f"Successfully retrieved {len(tracks)} recent tracks.")
+            print("Most recent track:", tracks[0])
         else:
             print(f"Could not retrieve recent tracks for user '{client.username}'. Check username and API keys.")
 
